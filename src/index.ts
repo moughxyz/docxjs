@@ -4,3 +4,4 @@ export * from "./html-renderer";
 export * from "./javascript";
 export * from "./utils";
 export * from "./word-document";
+export * from "./document/dom";
