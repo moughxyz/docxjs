@@ -42,18 +42,18 @@ export const defaultOptions: Options = {
     renderComments: false
 }
 
-export function parseAsync(data: Blob | any, userOptions?: Partial<Options>): Promise<any>  {
+export function parseAsync(data: Blob | any, userOptions?: Partial<Options>): Promise<WordDocument>  {
     const ops = { ...defaultOptions, ...userOptions };
     return WordDocument.load(data, new DocumentParser(ops), ops);
 }
 
-export async function renderDocument(document: any, bodyContainer: HTMLElement, styleContainer?: HTMLElement, userOptions?: Partial<Options>): Promise<any> {
+export async function renderDocument(document: any, bodyContainer: HTMLElement, styleContainer?: HTMLElement, userOptions?: Partial<Options>): Promise<void> {
     const ops = { ...defaultOptions, ...userOptions };
     const renderer = new HtmlRenderer(window.document);
 	return await renderer.render(document, bodyContainer, styleContainer, ops);
 }
 
-export async function renderAsync(data: Blob | any, bodyContainer: HTMLElement, styleContainer?: HTMLElement, userOptions?: Partial<Options>): Promise<any> {
+export async function renderAsync(data: Blob | any, bodyContainer: HTMLElement, styleContainer?: HTMLElement, userOptions?: Partial<Options>): Promise<WordDocument> {
 	const doc = await parseAsync(data, userOptions);
 	await renderDocument(doc, bodyContainer, styleContainer, userOptions);
     return doc;

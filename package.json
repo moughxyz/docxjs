@@ -1,6 +1,6 @@
 {
   "name": "docx-preview-cjs",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "license": "Apache-2.0",
   "keywords": [
     "word",
@@ -43,13 +43,13 @@
   ],
   "type": "module",
   "module": "dist/docx-preview.mjs",
-  "types": "dist/types.d.ts",
+  "types": "dist/index.d.ts",
   "main": "dist/docx-preview.js",
   "exports": {
     ".": {
       "import": "./dist/docx-preview.mjs",
       "require": "./dist/docx-preview.js",
-      "types": "./dist/types.d.ts"
+      "types": "./dist/index.d.ts"
     }
   }
 }
