@@ -5,3 +5,4 @@ export * from "./javascript";
 export * from "./utils";
 export * from "./word-document";
 export * from "./document/dom";
+export * from "./document/run";
