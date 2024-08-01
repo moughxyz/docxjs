@@ -9,6 +9,7 @@ declare module "document/dom" {
         Row = "row",
         Cell = "cell",
         Hyperlink = "hyperlink",
+        SmartTag = "smartTag",
         Drawing = "drawing",
         Image = "image",
         Text = "text",
@@ -82,6 +83,10 @@ declare module "document/dom" {
     export interface WmlHyperlink extends OpenXmlElement {
         id?: string;
         href?: string;
+    }
+    export interface WmlSmartTag extends OpenXmlElement {
+        uri?: string;
+        element?: string;
     }
     export interface WmlNoteReference extends OpenXmlElement {
         id: string;
@@ -438,7 +443,7 @@ declare module "comments/elements" {
     }
 }
 declare module "document-parser" {
-    import { WmlTable, IDomNumbering, WmlHyperlink, IDomImage, OpenXmlElement, WmlTableColumn, WmlTableCell, WmlTableRow, NumberingPicBullet } from "document/dom";
+    import { WmlTable, IDomNumbering, WmlHyperlink, WmlSmartTag, IDomImage, OpenXmlElement, WmlTableColumn, WmlTableCell, WmlTableRow, NumberingPicBullet } from "document/dom";
     import { DocumentElement } from "document/document";
     import { WmlParagraph } from "document/paragraph";
     import { WmlRun } from "document/run";
@@ -476,6 +481,7 @@ declare module "document-parser" {
         parseParagraphProperties(elem: Element, paragraph: WmlParagraph): void;
         parseFrame(node: Element, paragraph: WmlParagraph): void;
         parseHyperlink(node: Element, parent?: OpenXmlElement): WmlHyperlink;
+        parseSmartTag(node: Element, parent?: OpenXmlElement): WmlSmartTag;
         parseRun(node: Element, parent?: OpenXmlElement): WmlRun;
         parseMathElement(elem: Element): OpenXmlElement;
         parseMathProperies(elem: Element): Record<string, any>;
@@ -530,7 +536,8 @@ declare module "common/relationship" {
         ExtendedProperties = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/extended-properties",
         CoreProperties = "http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties",
         CustomProperties = "http://schemas.openxmlformats.org/package/2006/relationships/metadata/custom-properties",
-        Comments = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments"
+        Comments = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments",
+        CommentsExtended = "http://schemas.microsoft.com/office/2011/relationships/commentsExtended"
     }
     export function parseRelationships(root: Element, xml: XmlParser): Relationship[];
 }
@@ -886,6 +893,21 @@ declare module "comments/comments-part" {
         parseXml(root: Element): void;
     }
 }
+declare module "comments/comments-extended-part" {
+    import { Part } from "common/part";
+    import { OpenXmlPackage } from "common/open-xml-package";
+    export type CommentsExtended = {
+        paraId: string;
+        paraIdParent?: string;
+        done: boolean;
+    };
+    export class CommentsExtendedPart extends Part {
+        comments: CommentsExtended[];
+        commentMap: Record<string, CommentsExtended>;
+        constructor(pkg: OpenXmlPackage, path: string);
+        parseXml(root: Element): void;
+    }
+}
 declare module "word-document" {
     import { DocumentParser } from "document-parser";
     import { Relationship } from "common/relationship";
@@ -900,6 +922,7 @@ declare module "word-document" {
     import { EndnotesPart, FootnotesPart } from "notes/parts";
     import { SettingsPart } from "settings/settings-part";
     import { CommentsPart } from "comments/comments-part";
+    import { CommentsExtendedPart } from "comments/comments-extended-part";
     export class WordDocument {
         private _package;
         private _parser;
@@ -918,6 +941,7 @@ declare module "word-document" {
         extendedPropsPart: ExtendedPropsPart;
         settingsPart: SettingsPart;
         commentsPart: CommentsPart;
+        commentsExtendedPart: CommentsExtendedPart;
         static load(blob: Blob | any, parser: DocumentParser, options: any): Promise<WordDocument>;
         save(type?: string): Promise<any>;
         private loadRelationshipPart;
@@ -939,7 +963,7 @@ declare module "javascript" {
 }
 declare module "html-renderer" {
     import { WordDocument } from "word-document";
-    import { WmlTable, IDomNumbering, WmlHyperlink, IDomImage, OpenXmlElement, WmlTableColumn, WmlTableCell, WmlText, WmlSymbol, WmlBreak, WmlNoteReference } from "document/dom";
+    import { WmlTable, IDomNumbering, WmlHyperlink, IDomImage, OpenXmlElement, WmlTableColumn, WmlTableCell, WmlText, WmlSymbol, WmlBreak, WmlNoteReference, WmlSmartTag } from "document/dom";
     import { CommonProperties } from "document/common";
     import { Options } from "docx-preview";
     import { DocumentElement } from "document/document";
@@ -953,10 +977,15 @@ declare module "html-renderer" {
     import { ThemePart } from "theme/theme-part";
     import { Part } from "common/part";
     import { VmlElement } from "vml/vml";
-    import { WmlCommentRangeStart, WmlCommentReference } from "comments/elements";
+    import { WmlComment, WmlCommentRangeStart, WmlCommentReference } from "comments/elements";
     interface CellPos {
         col: number;
         row: number;
+    }
+    interface Section {
+        sectProps: SectionProperties;
+        elements: OpenXmlElement[];
+        pageBreak: boolean;
     }
     type CellVerticalMergeType = Record<number, HTMLTableCellElement>;
     export class HtmlRenderer {
@@ -978,10 +1007,12 @@ declare module "html-renderer" {
         usedHederFooterParts: any[];
         defaultTabSize: string;
         currentTabs: any[];
-        tabsTimeout: any;
+        commentHighlight: any;
+        commentMap: Record<string, Range>;
         tasks: Promise<any>[];
+        postRenderTasks: any[];
         constructor(htmlDocument: Document);
-        render(document: WordDocument, bodyContainer: HTMLElement, styleContainer: HTMLElement, options: Options): void;
+        render(document: WordDocument, bodyContainer: HTMLElement, styleContainer: HTMLElement, options: Options): Promise<void>;
         renderTheme(themePart: ThemePart, styleContainer: HTMLElement): void;
         renderFontTable(fontsPart: FontTablePart, styleContainer: HTMLElement): void;
         processStyleName(className: string): string;
@@ -990,32 +1021,33 @@ declare module "html-renderer" {
         processElement(element: OpenXmlElement): void;
         processTable(table: WmlTable): void;
         copyStyleProperties(input: Record<string, string>, output: Record<string, string>, attrs?: string[]): Record<string, string>;
-        createSection(className: string, props: SectionProperties): HTMLElement;
+        createPageElement(className: string, props: SectionProperties): HTMLElement;
         createSectionContent(props: SectionProperties): HTMLElement;
         renderSections(document: DocumentElement): HTMLElement[];
         renderHeaderFooter(refs: FooterHeaderReference[], props: SectionProperties, page: number, firstOfSection: boolean, into: HTMLElement): void;
         isPageBreakElement(elem: OpenXmlElement): boolean;
-        splitBySection(elements: OpenXmlElement[]): {
-            sectProps: SectionProperties;
-            elements: OpenXmlElement[];
-        }[];
+        isPageBreakSection(prev: SectionProperties, next: SectionProperties): boolean;
+        splitBySection(elements: OpenXmlElement[], defaultProps: SectionProperties): Section[];
+        groupByPageBreaks(sections: Section[]): Section[][];
         renderWrapper(children: HTMLElement[]): HTMLDivElement;
         renderDefaultStyle(): HTMLStyleElement;
         renderNumbering(numberings: IDomNumbering[], styleContainer: HTMLElement): HTMLStyleElement;
         renderStyles(styles: IDomStyle[]): HTMLElement;
         renderNotes(noteIds: string[], notesMap: Record<string, WmlBaseNote>, into: HTMLElement): void;
         renderElement(elem: OpenXmlElement): Node | Node[];
-        renderChildren(elem: OpenXmlElement, into?: Element): Node[];
-        renderElements(elems: OpenXmlElement[], into?: Element): Node[];
+        renderChildren(elem: OpenXmlElement, into?: Node): Node[];
+        renderElements(elems: OpenXmlElement[], into?: Node): Node[];
         renderContainer(elem: OpenXmlElement, tagName: keyof HTMLElementTagNameMap, props?: Record<string, any>): HTMLElement | HTMLDivElement | HTMLParagraphElement | HTMLObjectElement | HTMLTableElement | HTMLAnchorElement | HTMLAreaElement | HTMLAudioElement | HTMLBaseElement | HTMLQuoteElement | HTMLBodyElement | HTMLBRElement | HTMLButtonElement | HTMLCanvasElement | HTMLTableCaptionElement | HTMLTableColElement | HTMLDataElement | HTMLDataListElement | HTMLModElement | HTMLDetailsElement | HTMLDialogElement | HTMLDListElement | HTMLEmbedElement | HTMLFieldSetElement | HTMLFormElement | HTMLHeadingElement | HTMLHeadElement | HTMLHRElement | HTMLHtmlElement | HTMLIFrameElement | HTMLImageElement | HTMLInputElement | HTMLLabelElement | HTMLLegendElement | HTMLLIElement | HTMLLinkElement | HTMLMapElement | HTMLMenuElement | HTMLMetaElement | HTMLMeterElement | HTMLOListElement | HTMLOptGroupElement | HTMLOptionElement | HTMLOutputElement | HTMLPictureElement | HTMLPreElement | HTMLProgressElement | HTMLScriptElement | HTMLSelectElement | HTMLSlotElement | HTMLSourceElement | HTMLSpanElement | HTMLStyleElement | HTMLTableSectionElement | HTMLTableCellElement | HTMLTemplateElement | HTMLTextAreaElement | HTMLTimeElement | HTMLTitleElement | HTMLTableRowElement | HTMLTrackElement | HTMLUListElement | HTMLVideoElement;
         renderContainerNS(elem: OpenXmlElement, ns: string, tagName: string, props?: Record<string, any>): any;
         renderParagraph(elem: WmlParagraph): HTMLParagraphElement;
         renderRunProperties(style: any, props: RunProperties): void;
         renderCommonProperties(style: any, props: CommonProperties): void;
         renderHyperlink(elem: WmlHyperlink): HTMLAnchorElement;
+        renderSmartTag(elem: WmlSmartTag): HTMLSpanElement;
         renderCommentRangeStart(commentStart: WmlCommentRangeStart): Comment;
         renderCommentRangeEnd(commentEnd: WmlCommentRangeStart): Comment;
-        renderCommentReference(commentRef: WmlCommentReference): Comment;
+        renderCommentReference(commentRef: WmlCommentReference): DocumentFragment;
+        renderCommentContent(comment: WmlComment, container: Node): void;
         renderDrawing(elem: OpenXmlElement): HTMLDivElement;
         renderImage(elem: IDomImage): HTMLImageElement;
         renderText(elem: WmlText): Text;
@@ -1055,6 +1087,7 @@ declare module "html-renderer" {
         numFormatToCssValue(format: string): any;
         refreshTabStops(): void;
         createElement: typeof createElement;
+        later(func: Function): void;
     }
     type ChildType = Node | string;
     function createElement<T extends keyof HTMLElementTagNameMap>(tagName: T, props?: Partial<Record<keyof HTMLElementTagNameMap[T], any>>, children?: ChildType[]): HTMLElementTagNameMap[T];
@@ -1077,9 +1110,10 @@ declare module "docx-preview" {
         ignoreLastRenderedPageBreak: boolean;
         useBase64URL: boolean;
         renderChanges: boolean;
+        renderComments: boolean;
     }
     export const defaultOptions: Options;
-    export function praseAsync(data: Blob | any, userOptions?: Partial<Options>): Promise<any>;
+    export function parseAsync(data: Blob | any, userOptions?: Partial<Options>): Promise<any>;
     export function renderDocument(document: any, bodyContainer: HTMLElement, styleContainer?: HTMLElement, userOptions?: Partial<Options>): Promise<any>;
     export function renderAsync(data: Blob | any, bodyContainer: HTMLElement, styleContainer?: HTMLElement, userOptions?: Partial<Options>): Promise<any>;
 }

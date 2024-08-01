@@ -1,6 +1,6 @@
 import {
 	DomType, WmlTable, IDomNumbering,
-	WmlHyperlink, IDomImage, OpenXmlElement, WmlTableColumn, WmlTableCell,
+	WmlHyperlink, WmlSmartTag, IDomImage, OpenXmlElement, WmlTableColumn, WmlTableCell,
 	WmlTableRow, NumberingPicBullet, WmlText, WmlSymbol, WmlBreak, WmlNoteReference
 } from './document/dom';
 import { DocumentElement } from './document/document';
@@ -443,7 +443,7 @@ export class DocumentParser {
 
 				case "lvlPicBulletId":
 					var id = xml.intAttr(n, "val");
-					result.bullet = bullets.find(x => x.id == id);
+					result.bullet = bullets.find(x => x?.id == id);
 					break;
 
 				case "lvlText":
@@ -501,6 +501,10 @@ export class DocumentParser {
 
 				case "hyperlink":
 					result.children.push(this.parseHyperlink(el, result));
+					break;
+				
+				case "smartTag":
+					result.children.push(this.parseSmartTag(el, result));
 					break;
 
 				case "bookmarkStart":
@@ -588,6 +592,28 @@ export class DocumentParser {
 
 		if (relId)
 			result.id = relId;
+
+		xmlUtil.foreach(node, c => {
+			switch (c.localName) {
+				case "r":
+					result.children.push(this.parseRun(c, result));
+					break;
+			}
+		});
+
+		return result;
+	}
+	
+	parseSmartTag(node: Element, parent?: OpenXmlElement): WmlSmartTag {
+		var result: WmlSmartTag = { type: DomType.SmartTag, parent, children: [] };
+		var uri = xml.attr(node, "uri");
+		var element = xml.attr(node, "element");
+
+		if (uri)
+			result.uri = uri;
+
+		if (element)
+			result.element = element;
 
 		xmlUtil.foreach(node, c => {
 			switch (c.localName) {
@@ -823,6 +849,7 @@ export class DocumentParser {
 
 		let wrapType: "wrapTopAndBottom" | "wrapNone" | null = null;
 		let simplePos = xml.boolAttr(node, "simplePos");
+		let behindDoc = xml.boolAttr(node, "behindDoc");
 
 		let posX = { relative: "page", align: "left", offset: "0" };
 		let posY = { relative: "page", align: "top", offset: "0" };
@@ -1273,7 +1300,7 @@ export class DocumentParser {
 				case "lang":
 					style["$lang"] = xml.attr(c, "val");
 					break;
-
+	
 				case "bCs":
 				case "iCs":
 				case "szCs":

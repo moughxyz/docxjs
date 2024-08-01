@@ -24,6 +24,7 @@
         RelationshipTypes["CoreProperties"] = "http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties";
         RelationshipTypes["CustomProperties"] = "http://schemas.openxmlformats.org/package/2006/relationships/metadata/custom-properties";
         RelationshipTypes["Comments"] = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments";
+        RelationshipTypes["CommentsExtended"] = "http://schemas.microsoft.com/office/2011/relationships/commentsExtended";
     })(RelationshipTypes || (RelationshipTypes = {}));
     function parseRelationships(root, xml) {
         return xml.elements(root).map(e => ({
@@ -291,7 +292,8 @@
             this.xmlParser = new XmlParser();
         }
         get(path) {
-            return this._zip.files[normalizePath(path)];
+            const p = normalizePath(path);
+            return this._zip.files[p] ?? this._zip.files[p.replace(/\//g, '\\')];
         }
         update(path, content) {
             this._zip.file(path, content);
@@ -703,6 +705,7 @@
         DomType["Row"] = "row";
         DomType["Cell"] = "cell";
         DomType["Hyperlink"] = "hyperlink";
+        DomType["SmartTag"] = "smartTag";
         DomType["Drawing"] = "drawing";
         DomType["Image"] = "image";
         DomType["Text"] = "text";
@@ -1063,6 +1066,24 @@
         }
     }
 
+    class CommentsExtendedPart extends Part {
+        constructor(pkg, path) {
+            super(pkg, path);
+            this.comments = [];
+        }
+        parseXml(root) {
+            const xml = this._package.xmlParser;
+            for (let el of xml.elements(root, "commentEx")) {
+                this.comments.push({
+                    paraId: xml.attr(el, 'paraId'),
+                    paraIdParent: xml.attr(el, 'paraIdParent'),
+                    done: xml.boolAttr(el, 'done')
+                });
+            }
+            this.commentMap = keyBy(this.comments, x => x.paraId);
+        }
+    }
+
     const topLevelRels = [
         { type: RelationshipTypes.OfficeDocument, target: "word/document.xml" },
         { type: RelationshipTypes.ExtendedProperties, target: "docProps/app.xml" },
@@ -1137,6 +1158,9 @@
                     break;
                 case RelationshipTypes.Comments:
                     this.commentsPart = part = new CommentsPart(this._package, path, this._parser);
+                    break;
+                case RelationshipTypes.CommentsExtended:
+                    this.commentsExtendedPart = part = new CommentsExtendedPart(this._package, path);
                     break;
             }
             if (part == null)
@@ -1688,7 +1712,7 @@
                         break;
                     case "lvlPicBulletId":
                         var id = globalXmlParser.intAttr(n, "val");
-                        result.bullet = bullets.find(x => x.id == id);
+                        result.bullet = bullets.find(x => x?.id == id);
                         break;
                     case "lvlText":
                         result.levelText = globalXmlParser.attr(n, "val");
@@ -1734,6 +1758,9 @@
                         break;
                     case "hyperlink":
                         result.children.push(this.parseHyperlink(el, result));
+                        break;
+                    case "smartTag":
+                        result.children.push(this.parseSmartTag(el, result));
                         break;
                     case "bookmarkStart":
                         result.children.push(parseBookmarkStart(el, globalXmlParser));
@@ -1799,6 +1826,23 @@
                 result.href = "#" + anchor;
             if (relId)
                 result.id = relId;
+            xmlUtil.foreach(node, c => {
+                switch (c.localName) {
+                    case "r":
+                        result.children.push(this.parseRun(c, result));
+                        break;
+                }
+            });
+            return result;
+        }
+        parseSmartTag(node, parent) {
+            var result = { type: DomType.SmartTag, parent, children: [] };
+            var uri = globalXmlParser.attr(node, "uri");
+            var element = globalXmlParser.attr(node, "element");
+            if (uri)
+                result.uri = uri;
+            if (element)
+                result.element = element;
             xmlUtil.foreach(node, c => {
                 switch (c.localName) {
                     case "r":
@@ -1998,6 +2042,7 @@
             var isAnchor = node.localName == "anchor";
             let wrapType = null;
             let simplePos = globalXmlParser.boolAttr(node, "simplePos");
+            globalXmlParser.boolAttr(node, "behindDoc");
             let posX = { relative: "page", align: "left", offset: "0" };
             let posY = { relative: "page", align: "top", offset: "0" };
             for (var n of globalXmlParser.elements(node)) {
@@ -2725,17 +2770,21 @@
             this.currentEndnoteIds = [];
             this.usedHederFooterParts = [];
             this.currentTabs = [];
-            this.tabsTimeout = 0;
+            this.commentMap = {};
             this.tasks = [];
+            this.postRenderTasks = [];
             this.createElement = createElement;
         }
-        render(document, bodyContainer, styleContainer = null, options) {
+        async render(document, bodyContainer, styleContainer = null, options) {
             this.document = document;
             this.options = options;
             this.className = options.className;
             this.rootSelector = options.inWrapper ? `.${this.className}-wrapper` : ':root';
             this.styleMap = null;
             this.tasks = [];
+            if (this.options.renderComments && globalThis.Highlight) {
+                this.commentHighlight = new Highlight();
+            }
             styleContainer = styleContainer || bodyContainer;
             removeAllElements(styleContainer);
             removeAllElements(bodyContainer);
@@ -2773,6 +2822,11 @@
             else {
                 appendChildren(bodyContainer, sectionElements);
             }
+            if (this.commentHighlight && options.renderComments) {
+                CSS.highlights.set(`${this.className}-comments`, this.commentHighlight);
+            }
+            this.postRenderTasks.forEach(t => t());
+            await Promise.allSettled(this.tasks);
             this.refreshTabStops();
         }
         renderTheme(themePart, styleContainer) {
@@ -2812,7 +2866,6 @@
                         appendComment(styleContainer, `docxjs ${f.name} font`);
                         const cssText = this.styleToString("@font-face", cssValues);
                         styleContainer.appendChild(createStyleElement(cssText));
-                        this.refreshTabStops();
                     }));
                 }
             }
@@ -2890,7 +2943,7 @@
             }
             return output;
         }
-        createSection(className, props) {
+        createPageElement(className, props) {
             var elem = this.createElement("section", { className });
             if (props) {
                 if (props.pageMargins) {
@@ -2922,26 +2975,30 @@
         renderSections(document) {
             const result = [];
             this.processElement(document);
-            const sections = this.splitBySection(document.children);
+            const sections = this.splitBySection(document.children, document.props);
+            const pages = this.groupByPageBreaks(sections);
             let prevProps = null;
-            for (let i = 0, l = sections.length; i < l; i++) {
+            for (let i = 0, l = pages.length; i < l; i++) {
                 this.currentFootnoteIds = [];
-                const section = sections[i];
-                const props = section.sectProps || document.props;
-                const sectionElement = this.createSection(this.className, props);
-                this.renderStyleValues(document.cssStyle, sectionElement);
-                this.options.renderHeaders && this.renderHeaderFooter(props.headerRefs, props, result.length, prevProps != props, sectionElement);
-                var contentElement = this.createSectionContent(props);
-                this.renderElements(section.elements, contentElement);
-                sectionElement.appendChild(contentElement);
+                const section = pages[i][0];
+                let props = section.sectProps;
+                const pageElement = this.createPageElement(this.className, props);
+                this.renderStyleValues(document.cssStyle, pageElement);
+                this.options.renderHeaders && this.renderHeaderFooter(props.headerRefs, props, result.length, prevProps != props, pageElement);
+                for (const sect of pages[i]) {
+                    var contentElement = this.createSectionContent(sect.sectProps);
+                    this.renderElements(sect.elements, contentElement);
+                    pageElement.appendChild(contentElement);
+                    props = sect.sectProps;
+                }
                 if (this.options.renderFootnotes) {
-                    this.renderNotes(this.currentFootnoteIds, this.footnoteMap, sectionElement);
+                    this.renderNotes(this.currentFootnoteIds, this.footnoteMap, pageElement);
                 }
                 if (this.options.renderEndnotes && i == l - 1) {
-                    this.renderNotes(this.currentEndnoteIds, this.endnoteMap, sectionElement);
+                    this.renderNotes(this.currentEndnoteIds, this.endnoteMap, pageElement);
                 }
-                this.options.renderFooters && this.renderHeaderFooter(props.footerRefs, props, result.length, prevProps != props, sectionElement);
-                result.push(sectionElement);
+                this.options.renderFooters && this.renderHeaderFooter(props.footerRefs, props, result.length, prevProps != props, pageElement);
+                result.push(pageElement);
                 prevProps = props;
             }
             return result;
@@ -2980,15 +3037,25 @@
                 return !this.options.ignoreLastRenderedPageBreak;
             return elem.break == "page";
         }
-        splitBySection(elements) {
-            var current = { sectProps: null, elements: [] };
+        isPageBreakSection(prev, next) {
+            if (!prev)
+                return false;
+            if (!next)
+                return false;
+            return prev.pageSize?.orientation != next.pageSize?.orientation
+                || prev.pageSize?.width != next.pageSize?.width
+                || prev.pageSize?.height != next.pageSize?.height;
+        }
+        splitBySection(elements, defaultProps) {
+            var current = { sectProps: null, elements: [], pageBreak: false };
             var result = [current];
             for (let elem of elements) {
                 if (elem.type == DomType.Paragraph) {
                     const s = this.findStyle(elem.styleName);
                     if (s?.paragraphProps?.pageBreakBefore) {
                         current.sectProps = sectProps;
-                        current = { sectProps: null, elements: [] };
+                        current.pageBreak = true;
+                        current = { sectProps: null, elements: [], pageBreak: false };
                         result.push(current);
                     }
                 }
@@ -3006,7 +3073,8 @@
                     }
                     if (sectProps || pBreakIndex != -1) {
                         current.sectProps = sectProps;
-                        current = { sectProps: null, elements: [] };
+                        current.pageBreak = pBreakIndex != -1;
+                        current = { sectProps: null, elements: [], pageBreak: false };
                         result.push(current);
                     }
                     if (pBreakIndex != -1) {
@@ -3030,13 +3098,25 @@
             let currentSectProps = null;
             for (let i = result.length - 1; i >= 0; i--) {
                 if (result[i].sectProps == null) {
-                    result[i].sectProps = currentSectProps;
+                    result[i].sectProps = currentSectProps ?? defaultProps;
                 }
                 else {
                     currentSectProps = result[i].sectProps;
                 }
             }
             return result;
+        }
+        groupByPageBreaks(sections) {
+            let current = [];
+            let prev;
+            const result = [current];
+            for (let s of sections) {
+                current.push(s);
+                if (this.options.ignoreLastRenderedPageBreak || s.pageBreak || this.isPageBreakSection(prev, s.sectProps))
+                    result.push(current = []);
+                prev = s.sectProps;
+            }
+            return result.filter(x => x.length > 0);
         }
         renderWrapper(children) {
             return this.createElement("div", { className: `${this.className}-wrapper` }, children);
@@ -3055,7 +3135,16 @@ section.${c}>footer { z-index: 1; }
 .${c} p { margin: 0pt; min-height: 1em; }
 .${c} span { white-space: pre-wrap; overflow-wrap: break-word; }
 .${c} a { color: inherit; text-decoration: inherit; }
+.${c} svg { fill: transparent; }
 `;
+            if (this.options.renderComments) {
+                styleText += `
+.${c}-comment-ref { cursor: default; }
+.${c}-comment-popover { display: none; z-index: 1000; padding: 0.5rem; background: white; position: absolute; box-shadow: 0 0 0.25rem rgba(0, 0, 0, 0.25); width: 30ch; }
+.${c}-comment-ref:hover~.${c}-comment-popover { display: block; }
+.${c}-comment-author,.${c}-comment-date { font-size: 0.875rem; color: #888; }
+`;
+            }
             return createStyleElement(styleText);
         }
         renderNumbering(numberings, styleContainer) {
@@ -3157,6 +3246,8 @@ section.${c}>footer { z-index: 1; }
                     return this.renderTableCell(elem);
                 case DomType.Hyperlink:
                     return this.renderHyperlink(elem);
+                case DomType.SmartTag:
+                    return this.renderSmartTag(elem);
                 case DomType.Drawing:
                     return this.renderDrawing(elem);
                 case DomType.Image:
@@ -3307,23 +3398,48 @@ section.${c}>footer { z-index: 1; }
             }
             return result;
         }
+        renderSmartTag(elem) {
+            var result = this.createElement("span");
+            this.renderChildren(elem, result);
+            return result;
+        }
         renderCommentRangeStart(commentStart) {
-            if (!this.options.experimental)
+            if (!this.options.renderComments)
                 return null;
-            return this.htmlDocument.createComment(`start of comment #${commentStart.id}`);
+            const rng = new Range();
+            this.commentHighlight?.add(rng);
+            const result = this.htmlDocument.createComment(`start of comment #${commentStart.id}`);
+            this.later(() => rng.setStart(result, 0));
+            this.commentMap[commentStart.id] = rng;
+            return result;
         }
         renderCommentRangeEnd(commentEnd) {
-            if (!this.options.experimental)
+            if (!this.options.renderComments)
                 return null;
-            return this.htmlDocument.createComment(`end of comment #${commentEnd.id}`);
+            const rng = this.commentMap[commentEnd.id];
+            const result = this.htmlDocument.createComment(`end of comment #${commentEnd.id}`);
+            this.later(() => rng?.setEnd(result, 0));
+            return result;
         }
         renderCommentReference(commentRef) {
-            if (!this.options.experimental)
+            if (!this.options.renderComments)
                 return null;
             var comment = this.document.commentsPart?.commentMap[commentRef.id];
             if (!comment)
                 return null;
-            return this.htmlDocument.createComment(`comment #${comment.id} by ${comment.author} on ${comment.date}`);
+            const frg = new DocumentFragment();
+            const commentRefEl = createElement("span", { className: `${this.className}-comment-ref` }, ['💬']);
+            const commentsContainerEl = createElement("div", { className: `${this.className}-comment-popover` });
+            this.renderCommentContent(comment, commentsContainerEl);
+            frg.appendChild(this.htmlDocument.createComment(`comment #${comment.id} by ${comment.author} on ${comment.date}`));
+            frg.appendChild(commentRefEl);
+            frg.appendChild(commentsContainerEl);
+            return frg;
+        }
+        renderCommentContent(comment, container) {
+            container.appendChild(createElement('div', { className: `${this.className}-comment-author` }, [comment.author]));
+            container.appendChild(createElement('div', { className: `${this.className}-comment-date` }, [new Date(comment.date).toLocaleString()]));
+            this.renderChildren(comment, container);
         }
         renderDrawing(elem) {
             var result = this.createElement("div");
@@ -3690,13 +3806,15 @@ section.${c}>footer { z-index: 1; }
         refreshTabStops() {
             if (!this.options.experimental)
                 return;
-            clearTimeout(this.tabsTimeout);
-            this.tabsTimeout = setTimeout(() => {
+            setTimeout(() => {
                 const pixelToPoint = computePixelToPoint();
                 for (let tab of this.currentTabs) {
                     updateTabStop(tab.span, tab.stops, this.defaultTabSize, pixelToPoint);
                 }
             }, 500);
+        }
+        later(func) {
+            this.postRenderTasks.push(func);
         }
     }
     function createElement(tagName, props, children) {
@@ -3746,26 +3864,26 @@ section.${c}>footer { z-index: 1; }
         renderFootnotes: true,
         renderEndnotes: true,
         useBase64URL: false,
-        renderChanges: false
+        renderChanges: false,
+        renderComments: false
     };
-    function praseAsync(data, userOptions) {
+    function parseAsync(data, userOptions) {
         const ops = { ...defaultOptions, ...userOptions };
         return WordDocument.load(data, new DocumentParser(ops), ops);
     }
     async function renderDocument(document, bodyContainer, styleContainer, userOptions) {
         const ops = { ...defaultOptions, ...userOptions };
         const renderer = new HtmlRenderer(window.document);
-        renderer.render(document, bodyContainer, styleContainer, ops);
-        return Promise.allSettled(renderer.tasks);
+        return await renderer.render(document, bodyContainer, styleContainer, ops);
     }
     async function renderAsync(data, bodyContainer, styleContainer, userOptions) {
-        const doc = await praseAsync(data, userOptions);
+        const doc = await parseAsync(data, userOptions);
         await renderDocument(doc, bodyContainer, styleContainer, userOptions);
         return doc;
     }
 
     exports.defaultOptions = defaultOptions;
-    exports.praseAsync = praseAsync;
+    exports.parseAsync = parseAsync;
     exports.renderAsync = renderAsync;
     exports.renderDocument = renderDocument;
 
