@@ -1,7 +1,8 @@
 import { WordDocument } from './word-document';
 import {
 	DomType, WmlTable, IDomNumbering,
-	WmlHyperlink, IDomImage, OpenXmlElement, WmlTableColumn, WmlTableCell, WmlText, WmlSymbol, WmlBreak, WmlNoteReference
+	WmlHyperlink, IDomImage, OpenXmlElement, WmlTableColumn, WmlTableCell, WmlText, WmlSymbol, WmlBreak, WmlNoteReference,
+	WmlSmartTag
 } from './document/dom';
 import { CommonProperties } from './document/common';
 import { Options } from './docx-preview';
@@ -19,7 +20,7 @@ import { ThemePart } from './theme/theme-part';
 import { BaseHeaderFooterPart } from './header-footer/parts';
 import { Part } from './common/part';
 import { VmlElement } from './vml/vml';
-import { WmlCommentRangeStart, WmlCommentReference } from './comments/elements';
+import { WmlComment, WmlCommentRangeStart, WmlCommentReference } from './comments/elements';
 
 const ns = {
 	svg: "http://www.w3.org/2000/svg",
@@ -30,6 +31,14 @@ interface CellPos {
 	col: number;
 	row: number;
 }
+
+interface Section {
+	sectProps: SectionProperties;
+	elements: OpenXmlElement[];
+	pageBreak: boolean;
+}
+
+declare const Highlight: any;
 
 type CellVerticalMergeType = Record<number, HTMLTableCellElement>;
 
@@ -55,20 +64,27 @@ export class HtmlRenderer {
 
 	defaultTabSize: string;
 	currentTabs: any[] = [];
-	tabsTimeout: any = 0;
+
+	commentHighlight: any;
+	commentMap: Record<string, Range> = {};
 
 	tasks: Promise<any>[] = [];
+	postRenderTasks: any[] = [];
 
 	constructor(public htmlDocument: Document) {
 	}
 
-	render(document: WordDocument, bodyContainer: HTMLElement, styleContainer: HTMLElement = null, options: Options) {
+	async render(document: WordDocument, bodyContainer: HTMLElement, styleContainer: HTMLElement = null, options: Options) {
 		this.document = document;
 		this.options = options;
 		this.className = options.className;
 		this.rootSelector = options.inWrapper ? `.${this.className}-wrapper` : ':root';
 		this.styleMap = null;
 		this.tasks = [];
+
+		if (this.options.renderComments && globalThis.Highlight) {
+			this.commentHighlight = new Highlight();
+		}
 
 		styleContainer = styleContainer || bodyContainer;
 
@@ -121,6 +137,14 @@ export class HtmlRenderer {
 			appendChildren(bodyContainer, sectionElements);
 		}
 
+		if (this.commentHighlight && options.renderComments) {
+			(CSS as any).highlights.set(`${this.className}-comments`, this.commentHighlight);
+		}
+
+		this.postRenderTasks.forEach(t => t());
+
+		await Promise.allSettled(this.tasks);
+
 		this.refreshTabStops();
 	}
 
@@ -170,7 +194,6 @@ export class HtmlRenderer {
 					appendComment(styleContainer, `docxjs ${f.name} font`);
 					const cssText = this.styleToString("@font-face", cssValues);
 					styleContainer.appendChild(createStyleElement(cssText));
-					this.refreshTabStops();
 				}));
 			}
 		}
@@ -264,7 +287,7 @@ export class HtmlRenderer {
 		return output;
 	}
 
-	createSection(className: string, props: SectionProperties): HTMLElement {
+	createPageElement(className: string, props: SectionProperties): HTMLElement {
 		var elem = this.createElement("section", { className });
 
 		if (props) {
@@ -305,36 +328,40 @@ export class HtmlRenderer {
 		const result = [];
 
 		this.processElement(document);
-		const sections = this.splitBySection(document.children);
+		const sections = this.splitBySection(document.children, document.props);
+		const pages = this.groupByPageBreaks(sections);
 		let prevProps = null;
 
-		for (let i = 0, l = sections.length; i < l; i++) {
+		for (let i = 0, l = pages.length; i < l; i++) {			
 			this.currentFootnoteIds = [];
 
-			const section = sections[i];
-			const props = section.sectProps || document.props;
-			const sectionElement = this.createSection(this.className, props);
-			this.renderStyleValues(document.cssStyle, sectionElement);
+			const section = pages[i][0];
+			let props = section.sectProps;
+			const pageElement = this.createPageElement(this.className, props);
+			this.renderStyleValues(document.cssStyle, pageElement);
 
 			this.options.renderHeaders && this.renderHeaderFooter(props.headerRefs, props,
-				result.length, prevProps != props, sectionElement);
+				result.length, prevProps != props, pageElement);
 
-			var contentElement = this.createSectionContent(props);
-			this.renderElements(section.elements, contentElement);
-			sectionElement.appendChild(contentElement);
+			for (const sect of pages[i]) {
+				var contentElement = this.createSectionContent(sect.sectProps);
+				this.renderElements(sect.elements, contentElement);
+				pageElement.appendChild(contentElement);
+				props = sect.sectProps;
+			}
 
 			if (this.options.renderFootnotes) {
-				this.renderNotes(this.currentFootnoteIds, this.footnoteMap, sectionElement);
+				this.renderNotes(this.currentFootnoteIds, this.footnoteMap, pageElement);
 			}
 
 			if (this.options.renderEndnotes && i == l - 1) {
-				this.renderNotes(this.currentEndnoteIds, this.endnoteMap, sectionElement);
+				this.renderNotes(this.currentEndnoteIds, this.endnoteMap, pageElement);
 			}
 
 			this.options.renderFooters && this.renderHeaderFooter(props.footerRefs, props,
-				result.length, prevProps != props, sectionElement);
+				result.length, prevProps != props, pageElement);
 
-			result.push(sectionElement);
+			result.push(pageElement);
 			prevProps = props;
 		}
 
@@ -383,8 +410,17 @@ export class HtmlRenderer {
 		return (elem as WmlBreak).break == "page";
 	}
 
-	splitBySection(elements: OpenXmlElement[]): { sectProps: SectionProperties, elements: OpenXmlElement[] }[] {
-		var current = { sectProps: null, elements: [] };
+	isPageBreakSection(prev: SectionProperties, next: SectionProperties): boolean {
+		if (!prev) return false;
+		if (!next) return false;
+
+		return prev.pageSize?.orientation != next.pageSize?.orientation
+			|| prev.pageSize?.width != next.pageSize?.width
+			|| prev.pageSize?.height != next.pageSize?.height;
+	}
+
+	splitBySection(elements: OpenXmlElement[], defaultProps: SectionProperties): Section[] {
+		var current: Section = { sectProps: null, elements: [], pageBreak: false };
 		var result = [current];
 
 		for (let elem of elements) {
@@ -393,7 +429,8 @@ export class HtmlRenderer {
 
 				if (s?.paragraphProps?.pageBreakBefore) {
 					current.sectProps = sectProps;
-					current = { sectProps: null, elements: [] };
+					current.pageBreak = true;
+					current = { sectProps: null, elements: [], pageBreak: false };
 					result.push(current);
 				}
 			}
@@ -416,7 +453,8 @@ export class HtmlRenderer {
 
 				if (sectProps || pBreakIndex != -1) {
 					current.sectProps = sectProps;
-					current = { sectProps: null, elements: [] };
+					current.pageBreak = pBreakIndex != -1;
+					current = { sectProps: null, elements: [], pageBreak: false };
 					result.push(current);
 				}
 
@@ -445,13 +483,30 @@ export class HtmlRenderer {
 
 		for (let i = result.length - 1; i >= 0; i--) {
 			if (result[i].sectProps == null) {
-				result[i].sectProps = currentSectProps;
+				result[i].sectProps = currentSectProps ?? defaultProps;
 			} else {
 				currentSectProps = result[i].sectProps
 			}
 		}
 
 		return result;
+	}
+
+	groupByPageBreaks(sections: Section[]): Section[][] {
+		let current = [];
+		let prev: SectionProperties;
+		const result: Section[][] = [current];
+
+		for (let s of sections) {
+			current.push(s);
+
+			if (this.options.ignoreLastRenderedPageBreak || s.pageBreak || this.isPageBreakSection(prev, s.sectProps))
+				result.push(current = []);
+
+			prev = s.sectProps;
+		}
+
+		return result.filter(x => x.length > 0);
 	}
 
 	renderWrapper(children: HTMLElement[]) {
@@ -472,7 +527,17 @@ section.${c}>footer { z-index: 1; }
 .${c} p { margin: 0pt; min-height: 1em; }
 .${c} span { white-space: pre-wrap; overflow-wrap: break-word; }
 .${c} a { color: inherit; text-decoration: inherit; }
+.${c} svg { fill: transparent; }
 `;
+
+		if (this.options.renderComments) {
+			styleText += `
+.${c}-comment-ref { cursor: default; }
+.${c}-comment-popover { display: none; z-index: 1000; padding: 0.5rem; background: white; position: absolute; box-shadow: 0 0 0.25rem rgba(0, 0, 0, 0.25); width: 30ch; }
+.${c}-comment-ref:hover~.${c}-comment-popover { display: block; }
+.${c}-comment-author,.${c}-comment-date { font-size: 0.875rem; color: #888; }
+`
+		};
 
 		return createStyleElement(styleText);
 	}
@@ -670,6 +735,9 @@ section.${c}>footer { z-index: 1; }
 
 			case DomType.Hyperlink:
 				return this.renderHyperlink(elem);
+			
+			case DomType.SmartTag:
+				return this.renderSmartTag(elem);
 
 			case DomType.Drawing:
 				return this.renderDrawing(elem);
@@ -806,11 +874,11 @@ section.${c}>footer { z-index: 1; }
 		return null;
 	}
 
-	renderChildren(elem: OpenXmlElement, into?: Element): Node[] {
+	renderChildren(elem: OpenXmlElement, into?: Node): Node[] {
 		return this.renderElements(elem.children, into);
 	}
 
-	renderElements(elems: OpenXmlElement[], into?: Element): Node[] {
+	renderElements(elems: OpenXmlElement[], into?: Node): Node[] {
 		if (elems == null)
 			return null;
 
@@ -883,24 +951,40 @@ section.${c}>footer { z-index: 1; }
 
 		return result;
 	}
-
+	
+	renderSmartTag(elem: WmlSmartTag) {
+		var result = this.createElement("span");
+		this.renderChildren(elem, result);
+		return result;
+	}
 	
 	renderCommentRangeStart(commentStart: WmlCommentRangeStart) {
-		if (!this.options.experimental)
+		if (!this.options.renderComments)
 			return null;
 
-		return this.htmlDocument.createComment(`start of comment #${commentStart.id}`);
+		const rng = new Range();
+		this.commentHighlight?.add(rng);
+
+		const result = this.htmlDocument.createComment(`start of comment #${commentStart.id}`);
+		this.later(() => rng.setStart(result, 0));
+		this.commentMap[commentStart.id] = rng;
+
+		return result
 	}
 
 	renderCommentRangeEnd(commentEnd: WmlCommentRangeStart) {
-		if (!this.options.experimental)
+		if (!this.options.renderComments)
 			return null;
 
-		return this.htmlDocument.createComment(`end of comment #${commentEnd.id}`);
+		const rng = this.commentMap[commentEnd.id];
+		const result = this.htmlDocument.createComment(`end of comment #${commentEnd.id}`);
+		this.later(() => rng?.setEnd(result, 0));
+
+		return result;
 	}
 
 	renderCommentReference(commentRef: WmlCommentReference) {
-		if (!this.options.experimental)
+		if (!this.options.renderComments)
 			return null;
 
 		var comment = this.document.commentsPart?.commentMap[commentRef.id];
@@ -908,7 +992,24 @@ section.${c}>footer { z-index: 1; }
 		if (!comment)
 			return null;
 
-		return this.htmlDocument.createComment(`comment #${comment.id} by ${comment.author} on ${comment.date}`);
+		const frg = new DocumentFragment();
+		const commentRefEl = createElement("span", { className: `${this.className}-comment-ref` }, ['💬']);
+		const commentsContainerEl = createElement("div", { className: `${this.className}-comment-popover` });
+
+		this.renderCommentContent(comment, commentsContainerEl);
+
+		frg.appendChild(this.htmlDocument.createComment(`comment #${comment.id} by ${comment.author} on ${comment.date}`));
+		frg.appendChild(commentRefEl);
+		frg.appendChild(commentsContainerEl);
+
+		return frg;
+	}
+
+	renderCommentContent(comment: WmlComment, container: Node) {
+		container.appendChild(createElement('div', { className: `${this.className}-comment-author` }, [comment.author]));
+		container.appendChild(createElement('div', { className: `${this.className}-comment-date` }, [new Date(comment.date).toLocaleString()]));
+
+		this.renderChildren(comment, container);
 	}
 
 	renderDrawing(elem: OpenXmlElement) {
@@ -1384,9 +1485,7 @@ section.${c}>footer { z-index: 1; }
 		if (!this.options.experimental)
 			return;
 
-		clearTimeout(this.tabsTimeout);
-
-		this.tabsTimeout = setTimeout(() => {
+		setTimeout(() => {
 			const pixelToPoint = computePixelToPoint();
 
 			for (let tab of this.currentTabs) {
@@ -1396,6 +1495,10 @@ section.${c}>footer { z-index: 1; }
 	}
 
 	createElement = createElement;
+
+	later(func: Function) { 
+		this.postRenderTasks.push(func);
+	}
 }
 
 type ChildType = Node | string;
@@ -1427,7 +1530,7 @@ function removeAllElements(elem: HTMLElement) {
 	elem.innerHTML = '';
 }
 
-function appendChildren(elem: Element, children: (Node | string)[]) {
+function appendChildren(elem: Node, children: (Node | string)[]) {
 	children.forEach(c => elem.appendChild(isString(c) ? document.createTextNode(c) : c));
 }
 
